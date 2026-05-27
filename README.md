@@ -1,4 +1,4 @@
-# FuzzX-spirv
+# llvm-spirv-fuzz
 
 A crash-only libFuzzer harness for the LLVM SPIR-V backend, inspired by
 [FuzzX](https://github.com/SemiAnalysisAI/FuzzX).
