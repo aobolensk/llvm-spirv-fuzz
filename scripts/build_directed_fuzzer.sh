@@ -25,12 +25,18 @@ if [[ ! -f "$LLVM_DIR/LLVMConfig.cmake" ]]; then
     exit 2
 fi
 
+CMAKE_EXTRA=()
+if [[ -n "${SPIRV_TOOLS_DIR:-}" ]]; then
+    CMAKE_EXTRA+=("-DSPIRV_TOOLS_DIR=$SPIRV_TOOLS_DIR")
+fi
+
 cmake -S "$ROOT/fuzzer" -B "$FUZZER_BUILD_DIR" -G Ninja \
     -DLLVM_DIR="$LLVM_DIR" \
     -DFUZZER_SANITIZERS="$FUZZER_SANITIZERS" \
     -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
     -DCMAKE_C_COMPILER="${CC:-clang}" \
-    -DCMAKE_CXX_COMPILER="${CXX:-clang++}"
+    -DCMAKE_CXX_COMPILER="${CXX:-clang++}" \
+    "${CMAKE_EXTRA[@]}"
 
 cmake --build "$FUZZER_BUILD_DIR" --target llvm_spirv_crash_fuzzer \
     --parallel "${NINJAJOBS:-$(nproc)}"

@@ -41,9 +41,19 @@ fi
 mkdir -p "$CORPUS_DIR" "$ARTIFACT_DIR" "$FUZZX_FINDINGS_DIR" "$TMPDIR"
 "$ROOT/scripts/seed_ir_corpus.sh" "$CORPUS_DIR"
 
+if [[ -z "${FUZZX_SPIRV_VAL_BIN:-}" ]]; then
+    bundled="${LLVM_BUILD_DIR:-$ROOT/build/llvm-fuzzer}/bin/spirv-val"
+    if [[ -x "$bundled" ]]; then
+        FUZZX_SPIRV_VAL_BIN="$bundled"
+    elif on_path="$(command -v spirv-val 2>/dev/null)"; then
+        FUZZX_SPIRV_VAL_BIN="$on_path"
+    fi
+fi
+
 export TMPDIR
 export FUZZX_FINDINGS_DIR
 export ASAN_OPTIONS
+[[ -n "${FUZZX_SPIRV_VAL_BIN:-}" ]] && export FUZZX_SPIRV_VAL_BIN
 
 exec "$FUZZER_BIN" "$CORPUS_DIR" \
     -artifact_prefix="$ARTIFACT_DIR/" \

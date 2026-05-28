@@ -39,6 +39,9 @@ LLVM_USE_SANITIZE_COVERAGE="${LLVM_USE_SANITIZE_COVERAGE:-ON}"
 # every LLVM TU gets sancov even when LLVM_USE_SANITIZER is OFF.
 LLVM_FUZZX_SANCOV="${LLVM_FUZZX_SANCOV:-ON}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
+LLVM_FUZZX_SPIRV_VAL="${LLVM_FUZZX_SPIRV_VAL:-ON}"
+
+is_truthy() { [[ "${1:-}" =~ ^(1|ON|on|true|TRUE|yes|YES)$ ]]; }
 
 HOST_CLANG="${HOST_CLANG:-${CC:-clang}}"
 HOST_CLANGXX="${HOST_CLANGXX:-${CXX:-clang++}}"
@@ -65,7 +68,7 @@ else
     cmake_args+=(-DLLVM_USE_SANITIZER=)
 fi
 
-if [[ "$LLVM_FUZZX_SANCOV" =~ ^(1|ON|on|true|TRUE|yes|YES)$ ]]; then
+if is_truthy "$LLVM_FUZZX_SANCOV"; then
     SANCOV_FLAGS="-fsanitize-coverage=inline-8bit-counters,pc-table"
     cmake_args+=(
         -DCMAKE_C_FLAGS_INIT="$SANCOV_FLAGS"
@@ -73,10 +76,16 @@ if [[ "$LLVM_FUZZX_SANCOV" =~ ^(1|ON|on|true|TRUE|yes|YES)$ ]]; then
     )
 fi
 
+build_targets=(llc llvm-stress opt llvm-as)
+if is_truthy "$LLVM_FUZZX_SPIRV_VAL"; then
+    cmake_args+=(-DLLVM_INCLUDE_SPIRV_TOOLS_TESTS=ON)
+    build_targets+=(spirv-val)
+fi
+
 cmake "${cmake_args[@]}"
 
 cmake --build "$LLVM_BUILD_DIR" \
-    --target llc llvm-stress opt llvm-as \
+    --target "${build_targets[@]}" \
     --parallel "${NINJAJOBS:-$(nproc)}"
 
 cat <<EOF
