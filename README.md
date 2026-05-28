@@ -19,6 +19,15 @@ ln -s /path/to/llvm-project third_party/llvm-project
 To reuse an existing LLVM build, set `LLVM_DIR=/path/to/llvm-build/lib/cmake/llvm`
 for the second step.
 
+After each O0/O2 codegen the SPIR-V is validated; a validator crash or
+non-success diagnostic aborts so libFuzzer captures the reproducer. By default
+the bundled `spirv-val` (auto-discovered from `$LLVM_BUILD_DIR/bin` or `PATH`)
+is used; pass `SPIRV_TOOLS_DIR=/path/to/SPIRV-Tools/build` to
+`build_directed_fuzzer.sh` to link libspirv in-process instead.
+
+Runtime knobs: `FUZZX_SPIRV_VAL=0` disables; `FUZZX_SPIRV_TARGET_ENV` picks the
+target env (default `spv1.6`); `FUZZX_SPIRV_VAL_BIN` overrides the binary.
+
 ## Run
 
 ```

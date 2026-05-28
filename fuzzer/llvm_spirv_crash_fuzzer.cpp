@@ -11,16 +11,23 @@
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 
+#ifdef FUZZX_HAVE_SPIRV_TOOLS
+#include "spirv-tools/libspirv.h"
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -127,6 +134,176 @@ StringRef getCPU() {
   return "";
 }
 
+bool envFlag(const char *Name, bool Default) {
+  const char *Value = std::getenv(Name);
+  if (!Value || !*Value)
+    return Default;
+  StringRef V(Value);
+  return V != "0" && !V.equals_insensitive("false") &&
+         !V.equals_insensitive("no") && !V.equals_insensitive("off");
+}
+
+// Accepted by both spvParseTargetEnv and the spirv-val binary's --target-env.
+constexpr StringRef DefaultSPIRVTargetEnv = "spv1.6";
+
+const std::string &getSPIRVTargetEnvName() {
+  static const std::string Cached = [] {
+    const char *Env = std::getenv("FUZZX_SPIRV_TARGET_ENV");
+    return std::string((Env && *Env) ? Env : DefaultSPIRVTargetEnv);
+  }();
+  return Cached;
+}
+
+struct ValidationResult {
+  int Code = 0;
+  std::string Message;
+  bool Crashed = false;
+  bool Valid() const { return !Crashed && Code == 0; }
+};
+
+#ifndef FUZZX_HAVE_SPIRV_TOOLS
+const char *getSPIRVValBinary() {
+  static const char *Cached = std::getenv("FUZZX_SPIRV_VAL_BIN");
+  return (Cached && *Cached) ? Cached : nullptr;
+}
+
+ValidationResult runSPIRVValidator(ArrayRef<char> Object) {
+  ValidationResult R;
+  const char *Bin = getSPIRVValBinary();
+  if (!Bin) {
+    R.Code = -1;
+    R.Message = "FUZZX_SPIRV_VAL_BIN not set";
+    return R;
+  }
+  SmallString<128> Path;
+  if (auto EC = sys::fs::createTemporaryFile("fuzzx-spirv", "spv", Path)) {
+    R.Code = -1;
+    R.Message = "createTemporaryFile: " + EC.message();
+    return R;
+  }
+  {
+    std::error_code EC;
+    raw_fd_ostream Out(Path, EC, sys::fs::OF_None);
+    if (EC) {
+      sys::fs::remove(Path);
+      R.Code = -1;
+      R.Message = "open temp .spv: " + EC.message();
+      return R;
+    }
+    Out.write(Object.data(), Object.size());
+  }
+  const std::string &EnvName = getSPIRVTargetEnvName();
+  StringRef Args[] = {Bin, "--target-env", EnvName, Path};
+  std::optional<StringRef> Redirects[] = {std::nullopt, StringRef(""),
+                                          std::nullopt};
+  std::string ErrMsg;
+  bool ExecFailed = false;
+  int RC = sys::ExecuteAndWait(Bin, Args, /*Env=*/std::nullopt, Redirects,
+                               /*SecondsToWait=*/0, /*MemoryLimit=*/0,
+                               &ErrMsg, &ExecFailed);
+  sys::fs::remove(Path);
+  if (ExecFailed || RC == -1) {
+    R.Code = -1;
+    R.Message = "spawn failed: " + ErrMsg;
+  } else if (RC == -2) {
+    R.Crashed = true;
+    R.Code = RC;
+    R.Message = "crashed: " + ErrMsg;
+  } else {
+    R.Code = RC;
+    if (RC != 0)
+      R.Message = "spirv-val exit " + std::to_string(RC);
+  }
+  return R;
+}
+#else
+spv_target_env getSPIRVTargetEnv() {
+  static const spv_target_env Cached = [] {
+    spv_target_env Parsed;
+    if (spvParseTargetEnv(getSPIRVTargetEnvName().c_str(), &Parsed))
+      return Parsed;
+    return SPV_ENV_UNIVERSAL_1_6;
+  }();
+  return Cached;
+}
+
+spv_context getSPIRVContext() {
+  // SPIRV-Tools allows re-using a single spv_context across serial
+  // spvValidateBinary calls; per-call state lives in ValidationState_t.
+  static spv_context Cached = spvContextCreate(getSPIRVTargetEnv());
+  return Cached;
+}
+
+ValidationResult runSPIRVValidator(ArrayRef<char> Object) {
+  ValidationResult R;
+  if (Object.size() % sizeof(uint32_t) != 0) {
+    R.Code = SPV_ERROR_INVALID_BINARY;
+    R.Message = "object size not a multiple of 4";
+    return R;
+  }
+  const uint32_t *Words = reinterpret_cast<const uint32_t *>(Object.data());
+  size_t NumWords = Object.size() / sizeof(uint32_t);
+
+  CrashRecoveryContext CRC;
+  CRC.DumpStackAndCleanupOnFailure = true;
+  bool Ok = CRC.RunSafely([&] {
+    spv_context Ctx = getSPIRVContext();
+    spv_diagnostic Diag = nullptr;
+    R.Code = spvValidateBinary(Ctx, Words, NumWords, &Diag);
+    if (Diag) {
+      if (Diag->error)
+        R.Message = Diag->error;
+      spvDiagnosticDestroy(Diag);
+    }
+  });
+  if (!Ok) {
+    R.Crashed = true;
+    R.Code = CRC.RetCode;
+  }
+  return R;
+}
+#endif
+
+void saveFailureFinding(const uint8_t *Data, size_t Size, StringRef IRText,
+                        StringRef Kind, StringRef Stage,
+                        std::optional<int> CrashRetCode = std::nullopt) {
+  const char *FindingsDir = std::getenv("FUZZX_FINDINGS_DIR");
+  if (!FindingsDir || !*FindingsDir)
+    return;
+  std::error_code EC;
+  std::filesystem::create_directories(FindingsDir, EC);
+  auto Now = std::chrono::steady_clock::now().time_since_epoch().count();
+  std::string Base = std::string(FindingsDir) + "/" + Kind.str() + "-" +
+                     Stage.str() + "-" + std::to_string(getpid()) + "-" +
+                     std::to_string(Now);
+  if (CrashRetCode)
+    Base += "-rc" + std::to_string(*CrashRetCode);
+  std::ofstream BC(Base + ".bc", std::ios::binary);
+  if (BC)
+    BC.write(reinterpret_cast<const char *>(Data),
+             static_cast<std::streamsize>(Size));
+  if (!IRText.empty()) {
+    std::ofstream LL(Base + ".ll");
+    if (LL)
+      LL.write(IRText.data(), static_cast<std::streamsize>(IRText.size()));
+  }
+}
+
+void runValidatorStage(const uint8_t *Data, size_t Size, StringRef IRText,
+                       ArrayRef<char> Object, StringRef Tag) {
+  ValidationResult VR = runSPIRVValidator(Object);
+  if (VR.Valid())
+    return;
+  saveFailureFinding(Data, Size, IRText,
+                     VR.Crashed ? "validator-crash" : "validator-reject",
+                     (Tag + "-spirv-val").str(),
+                     std::optional<int>(VR.Code));
+  errs() << "FuzzX SPIR-V " << Tag << " validator "
+         << (VR.Crashed ? "crash" : "reject") << " (code " << VR.Code
+         << "): " << VR.Message << "\n";
+  std::abort();
+}
+
 std::unique_ptr<Module> createIRSkeletonModule(LLVMContext &Ctx,
                                                StringRef /*CPU*/) {
   auto M = std::make_unique<Module>("fuzzx_spirv_crash", Ctx);
@@ -211,31 +388,6 @@ std::unique_ptr<Module> parseIRCorpusModule(const uint8_t *Data, size_t Size,
   return Parsed;
 }
 
-void saveFailureFinding(const uint8_t *Data, size_t Size, StringRef IRText,
-                        StringRef Kind, StringRef Stage,
-                        std::optional<int> CrashRetCode = std::nullopt) {
-  const char *FindingsDir = std::getenv("FUZZX_FINDINGS_DIR");
-  if (!FindingsDir || !*FindingsDir)
-    return;
-  std::error_code EC;
-  std::filesystem::create_directories(FindingsDir, EC);
-  auto Now = std::chrono::steady_clock::now().time_since_epoch().count();
-  std::string Base = std::string(FindingsDir) + "/" + Kind.str() + "-" +
-                     Stage.str() + "-" + std::to_string(getpid()) + "-" +
-                     std::to_string(Now);
-  if (CrashRetCode)
-    Base += "-rc" + std::to_string(*CrashRetCode);
-  std::ofstream BC(Base + ".bc", std::ios::binary);
-  if (BC)
-    BC.write(reinterpret_cast<const char *>(Data),
-             static_cast<std::streamsize>(Size));
-  if (!IRText.empty()) {
-    std::ofstream LL(Base + ".ll");
-    if (LL)
-      LL.write(IRText.data(), static_cast<std::streamsize>(IRText.size()));
-  }
-}
-
 CompileResult compileIRModuleToObject(Module &M, StringRef CPU,
                                       OptimizationLevel Level,
                                       std::string *IRText = nullptr) {
@@ -284,6 +436,32 @@ CompileResult compileIRModuleToObject(Module &M, StringRef CPU,
   return R;
 }
 
+struct CompiledObject {
+  SmallVector<char, 0> Object;
+  std::string IR;
+};
+
+// Returns nullopt on non-crash compile failure (finding already saved).
+// Aborts on crash so libFuzzer captures the reproducer.
+std::optional<CompiledObject>
+runCompileStage(Module &M, StringRef CPU, OptimizationLevel Level,
+                StringRef Tag, const uint8_t *Data, size_t Size) {
+  CompiledObject Out;
+  CompileResult R = compileIRModuleToObject(M, CPU, Level, &Out.IR);
+  if (R.Success) {
+    Out.Object = std::move(R.Object);
+    return Out;
+  }
+  saveFailureFinding(
+      Data, Size, Out.IR,
+      R.Crashed ? "compiler-crash" : "compiler-failure",
+      (Tag + "-" + R.FailureStage).str(),
+      R.Crashed ? std::optional<int>(R.CrashRetCode) : std::nullopt);
+  if (R.Crashed)
+    std::abort();
+  return std::nullopt;
+}
+
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
@@ -297,21 +475,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
       parseIRCorpusModule(Data, Size, Ctx, CPU, &ValidInput);
   if (!ValidInput)
     return 0;
-  if (!validateIRCorpusModule(*M))
-    return 0;
 
-  std::string O0IR;
-  auto O0Obj = compileIRModuleToObject(*M, CPU, OptimizationLevel::O0, &O0IR);
-  if (!O0Obj.Success) {
-    saveFailureFinding(Data, Size, O0IR,
-                       O0Obj.Crashed ? "compiler-crash" : "compiler-failure",
-                       "o0-" + O0Obj.FailureStage,
-                       O0Obj.Crashed ? std::optional<int>(O0Obj.CrashRetCode)
-                                     : std::nullopt);
-    if (O0Obj.Crashed)
-      std::abort();
+  static const bool ValidatorEnabled = envFlag("FUZZX_SPIRV_VAL", true);
+
+  auto O0 = runCompileStage(*M, CPU, OptimizationLevel::O0, "o0", Data, Size);
+  if (!O0)
     return 0;
-  }
+  if (ValidatorEnabled)
+    runValidatorStage(Data, Size, O0->IR, O0->Object, "o0");
 
   // Re-parse a fresh copy for O2 since the O0 pipeline mutated the module.
   ValidInput = false;
@@ -320,18 +491,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
   if (!ValidInput)
     return 0;
 
-  std::string O2IR;
-  auto O2Obj = compileIRModuleToObject(*M2, CPU, OptimizationLevel::O2, &O2IR);
-  if (!O2Obj.Success) {
-    saveFailureFinding(Data, Size, O2IR,
-                       O2Obj.Crashed ? "compiler-crash" : "compiler-failure",
-                       "o2-" + O2Obj.FailureStage,
-                       O2Obj.Crashed ? std::optional<int>(O2Obj.CrashRetCode)
-                                     : std::nullopt);
-    if (O2Obj.Crashed)
-      std::abort();
+  auto O2 = runCompileStage(*M2, CPU, OptimizationLevel::O2, "o2", Data, Size);
+  if (!O2)
     return 0;
-  }
+  if (ValidatorEnabled)
+    runValidatorStage(Data, Size, O2->IR, O2->Object, "o2");
 
   // SPIR-V has no host runtime, so we stop after codegen.  See ../README.md
   // for why a faithful differential port (the AMDGPU/PTX pattern) requires
