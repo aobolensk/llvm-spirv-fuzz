@@ -94,5 +94,5 @@ LLVM fuzzer toolchain built in:
 
 Use it with:
   LLVM_BUILD_DIR=$LLVM_BUILD_DIR scripts/build_directed_fuzzer.sh
-  scripts/run_directed_fuzzer.sh -runs=10000
+  LLVM_BUILD_DIR=$LLVM_BUILD_DIR scripts/run_directed_fuzzer.sh -runs=10000
 EOF
