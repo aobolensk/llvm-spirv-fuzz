@@ -50,10 +50,29 @@ if [[ -z "${FUZZX_SPIRV_VAL_BIN:-}" ]]; then
     fi
 fi
 
+# Miscompile round-trip oracle: needs the Khronos `llvm-spirv` translator (for
+# reverse translation) and an `lli` that can interpret the result.  Absent
+# either, runMiscompileStage abstains automatically.
+if [[ -z "${FUZZX_SPIRV_TRANSLATOR_BIN:-}" ]]; then
+    if on_path="$(command -v llvm-spirv 2>/dev/null)"; then
+        FUZZX_SPIRV_TRANSLATOR_BIN="$on_path"
+    fi
+fi
+if [[ -z "${FUZZX_LLI_BIN:-}" ]]; then
+    bundled_lli="${LLVM_BUILD_DIR:-$ROOT/build/llvm-fuzzer}/bin/lli"
+    if [[ -x "$bundled_lli" ]]; then
+        FUZZX_LLI_BIN="$bundled_lli"
+    elif on_path="$(command -v lli 2>/dev/null)"; then
+        FUZZX_LLI_BIN="$on_path"
+    fi
+fi
+
 export TMPDIR
 export FUZZX_FINDINGS_DIR
 export ASAN_OPTIONS
 [[ -n "${FUZZX_SPIRV_VAL_BIN:-}" ]] && export FUZZX_SPIRV_VAL_BIN
+[[ -n "${FUZZX_SPIRV_TRANSLATOR_BIN:-}" ]] && export FUZZX_SPIRV_TRANSLATOR_BIN
+[[ -n "${FUZZX_LLI_BIN:-}" ]] && export FUZZX_LLI_BIN
 
 exec "$FUZZER_BIN" "$CORPUS_DIR" \
     -artifact_prefix="$ARTIFACT_DIR/" \

@@ -72,6 +72,7 @@ if(TARGET LLVM)
 else()
     llvm_map_components_to_libnames(LLVM_LIBS
         Analysis
+        AsmParser
         BitReader
         BitWriter
         CodeGen
