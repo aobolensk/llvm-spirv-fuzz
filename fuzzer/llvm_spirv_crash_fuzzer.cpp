@@ -718,9 +718,12 @@ std::unique_ptr<Module> parseIRCorpusModule(const uint8_t *Data, size_t Size,
   MemoryBufferRef MemBuf(Buffer, "fuzzx-spirv-ir-bitcode");
   std::unique_ptr<Module> Parsed;
   // BitcodeReader is not hardened against arbitrary mutated bytes; trap its
-  // assertions so we report only SPIR-V backend findings.
+  // assertions so we report only SPIR-V backend findings. A caught crash can
+  // leave Ctx type-uniquing tables corrupted, so Ctx is no longer safe to
+  // reuse afterward. Bail out of this input entirely rather than risk a
+  // bogus SEGV.
   CrashRecoveryContext CRC;
-  CRC.RunSafely([&]() {
+  bool Survived = CRC.RunSafely([&]() {
     Expected<std::unique_ptr<Module>> P = parseBitcodeFile(MemBuf, Ctx);
     if (!P) {
       consumeError(P.takeError());
@@ -728,6 +731,8 @@ std::unique_ptr<Module> parseIRCorpusModule(const uint8_t *Data, size_t Size,
     }
     Parsed = std::move(*P);
   });
+  if (!Survived)
+    return nullptr;
   if (!Parsed)
     return createIRSkeletonModule(Ctx, CPU);
   // Force the triple so corpus mutation of target metadata cannot send us to
